@@ -174,46 +174,88 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         return df
 
     def _looks_like_html_bytes(b: bytes) -> bool:
-        sniff = b[:512].lstrip().lower()
-        return sniff.startswith(b"<!doctype html") or sniff.startswith(b"<html") or (b"<body" in sniff)
+        sniff = b[:2048].lstrip().lower()
+        return (
+            sniff.startswith(b"<!doctype html")
+            or sniff.startswith(b"<html")
+            or b"<body" in sniff
+            or b"google drive" in sniff
+            or b"download anyway" in sniff
+            or b"quota exceeded" in sniff
+            or b"sign in" in sniff
+        )
 
-    # URL case: fetch first so we can detect Drive’s HTML interstitial
+    # Helper: robust gdown-by-ID fallback
+    def _gdown_fetch(any_url: str) -> bytes:
+        import gdown, tempfile, os
+        fid = extract_gdrive_id(any_url)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
+            tmp_path = tf.name
+        try:
+            if fid:
+                # Using the file ID is the most reliable path for Drive confirm pages
+                gdown.download(id=fid, output=tmp_path, quiet=True)
+            else:
+                gdown.download(any_url, tmp_path, quiet=True, fuzzy=True)
+            with open(tmp_path, "rb") as f:
+                return f.read()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # ---- URL case: fetch first so we can detect Drive’s HTML interstitial ----
     if isinstance(path_or_url, str) and path_or_url.lower().startswith(("http://", "https://")):
         url = path_or_url
         try:
-            r = requests.get(url, allow_redirects=True, timeout=90)
+            r = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=120,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                       "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"}
+            )
             r.raise_for_status()
             content = r.content
             ct = (r.headers.get("Content-Type") or "").lower()
         except Exception as e:
             raise RuntimeError(f"HTTP fetch failed: {e}")
 
-        # If Drive served HTML (virus-scan/confirm page), fall back to gdown
+        # If Drive served HTML (virus-scan/confirm/quota/login), switch to gdown-by-ID
         if "text/html" in ct or _looks_like_html_bytes(content):
             try:
-                import gdown
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
-                    tmp_path = tf.name
-                gdown.download(url, tmp_path, quiet=True, fuzzy=True)
-                with open(tmp_path, "rb") as f:
-                    buf = io.BytesIO(f.read())
-                os.unlink(tmp_path)
-                df = _read_from_buffer(buf)
+                content = _gdown_fetch(url)
             except Exception as ge:
                 raise RuntimeError(
-                    "The provided Google Drive link returned an HTML page (likely the large-file "
-                    "download-confirm screen). The automatic fallback also failed. "
-                    "Ensure the file is shared as **Anyone with the link (Viewer)**. "
+                    "Google Drive returned an HTML page (large-file confirm/quota/login). "
+                    "Automatic fallback via gdown failed. Ensure sharing is **Anyone with the link (Viewer)**. "
                     f"(gdown error: {ge})"
                 )
-        else:
-            df = _read_from_buffer(io.BytesIO(content))
-    else:
-        # Local path
-        with open(path_or_url, "rb") as f:
-            df = _read_from_buffer(io.BytesIO(f.read()))
 
-    # Numeric coercions & trial flags (unchanged)
+        # Try to parse as CSV; if parsing fails, try gdown once more (even if bytes arrived)
+        try:
+            df = _read_from_buffer(io.BytesIO(content))
+        except Exception:
+            # Safety net: sometimes Drive returns non-CSV bytes with non-HTML content-type
+            try:
+                content = _gdown_fetch(url)
+                df = _read_from_buffer(io.BytesIO(content))
+            except Exception as ge:
+                raise RuntimeError(
+                    "Downloaded bytes could not be parsed as CSV, and the gdown fallback failed. "
+                    "If this is a Google Sheet, use its **File → Download → CSV** link or a "
+                    "Sheets export URL; for Drive files, supply any standard share link. "
+                    f"(parse/gdown error: {ge})"
+                )
+
+    else:
+        # ---- Local path ----
+        with open(path_or_url, "rb") as f:
+            content = f.read()
+        df = _read_from_buffer(io.BytesIO(content))
+
+    # ---- Numeric coercions & trial flags (unchanged) ----
     for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
               COLS["months6"], COLS["months12"], COLS["months24"]]:
         if c in df.columns:
@@ -224,12 +266,31 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         df[COLS["trial_flag"]] = (df[COLS["trial_days"]].fillna(0) > 0).astype(int)
     if COLS["trial_converted"] in df.columns:
         df[COLS["trial_converted"]] = pd.to_numeric(df[COLS["trial_converted"]], errors="coerce")
-    return df
 
+    return df
+    
 csv_path_norm = normalize_csv_url(csv_path)
 if not csv_path_norm:
     st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
     st.stop()
+
+def extract_gdrive_id(u: str) -> str | None:
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    # /file/d/<ID>
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", u)
+    if m:
+        return m.group(1)
+    # ?id=<ID> (open?id=..., uc?id=..., view?id=..., usercontent?id=...)
+    qs = parse_qs(urlparse(u).query)
+    fid = (qs.get("id") or [None])[0]
+    if fid:
+        return fid
+    return None
+
 
 # Button-gated load so the app renders fast, then downloads on demand
 if "data_token" not in st.session_state:
@@ -749,6 +810,7 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
 
 
