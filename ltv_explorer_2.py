@@ -147,6 +147,9 @@ COLS = dict(
 # ------------------------------------------------
 @st.cache_data(show_spinner=True)
 def load_data(path_or_url: str) -> pd.DataFrame:
+    import io
+    import requests
+
     def _read_from_buffer(buf: io.BytesIO) -> pd.DataFrame:
         buf.seek(0)
         header = pd.read_csv(buf, nrows=0)
@@ -172,38 +175,25 @@ def load_data(path_or_url: str) -> pd.DataFrame:
 
     def _looks_like_html_bytes(b: bytes) -> bool:
         sniff = b[:512].lstrip().lower()
-        return sniff.startswith(b"<!doctype html") or sniff.startswith(b"<html") or b"<body" in sniff
+        return sniff.startswith(b"<!doctype html") or sniff.startswith(b"<html") or (b"<body" in sniff)
 
-    # URL path → fetch & sniff
+    # URL case: fetch first so we can detect Drive’s HTML interstitial
     if isinstance(path_or_url, str) and path_or_url.lower().startswith(("http://", "https://")):
         url = path_or_url
         try:
-            r = requests.get(
-                url,
-                allow_redirects=True,
-                timeout=90,
-                headers={"User-Agent": "Mozilla/5.0"}  # helps with some CDNs/Drive
-            )
+            r = requests.get(url, allow_redirects=True, timeout=90)
             r.raise_for_status()
             content = r.content
             ct = (r.headers.get("Content-Type") or "").lower()
         except Exception as e:
             raise RuntimeError(f"HTTP fetch failed: {e}")
 
-        # If Drive interstitial (HTML) → use gdown to bypass
+        # If Drive served HTML (virus-scan/confirm page), fall back to gdown
         if "text/html" in ct or _looks_like_html_bytes(content):
             try:
-                try:
-                    import gdown  # lazy import
-                except Exception as ie:
-                    raise RuntimeError(
-                        "Google Drive returned an HTML confirmation page for this large file. "
-                        "Install gdown (add 'gdown>=5.1.0' to requirements.txt)."
-                    ) from ie
-
+                import gdown
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
                     tmp_path = tf.name
-                # fuzzy=True lets gdown accept open?id=..., file/d/..., uc?id=..., etc.
                 gdown.download(url, tmp_path, quiet=True, fuzzy=True)
                 with open(tmp_path, "rb") as f:
                     buf = io.BytesIO(f.read())
@@ -212,12 +202,11 @@ def load_data(path_or_url: str) -> pd.DataFrame:
             except Exception as ge:
                 raise RuntimeError(
                     "The provided Google Drive link returned an HTML page (likely the large-file "
-                    "‘download anyway’ interstitial), and the fallback failed. "
-                    "Ensure the file is shared as **Anyone with the link (Viewer)** and that "
-                    "your app has 'gdown' installed."
-                ) from ge
+                    "download-confirm screen). The automatic fallback also failed. "
+                    "Ensure the file is shared as **Anyone with the link (Viewer)**. "
+                    f"(gdown error: {ge})"
+                )
         else:
-            # Direct CSV bytes
             df = _read_from_buffer(io.BytesIO(content))
     else:
         # Local path
@@ -229,14 +218,12 @@ def load_data(path_or_url: str) -> pd.DataFrame:
               COLS["months6"], COLS["months12"], COLS["months24"]]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
     if COLS["trial_days"] in df.columns:
         df[COLS["trial_days"]] = pd.to_numeric(df[COLS["trial_days"]], errors="coerce")
     if COLS["trial_flag"] not in df.columns and COLS["trial_days"] in df.columns:
         df[COLS["trial_flag"]] = (df[COLS["trial_days"]].fillna(0) > 0).astype(int)
     if COLS["trial_converted"] in df.columns:
         df[COLS["trial_converted"]] = pd.to_numeric(df[COLS["trial_converted"]], errors="coerce")
-
     return df
 
 csv_path_norm = normalize_csv_url(csv_path)
@@ -244,7 +231,20 @@ if not csv_path_norm:
     st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
     st.stop()
 
+# Button-gated load so the app renders fast, then downloads on demand
+if "data_token" not in st.session_state:
+    st.session_state.data_token = 0
+
+load_now = st.sidebar.button("Load / reload data", type="primary", use_container_width=True)
+if load_now:
+    st.session_state.data_token += 1
+
+if st.session_state.data_token == 0:
+    st.info("Set the CSV link, then click **Load / reload data** to fetch the dataset.")
+    st.stop()
+
 try:
+    # cache key includes the URL; the button increments token so users can force a refresh
     df_raw = load_data(csv_path_norm)
 except Exception as e:
     st.error(f"Failed to load CSV: {e}")
@@ -742,13 +742,14 @@ def strip_html_cell(html_cell: str) -> str:
     return " ".join(txt.split())
 
 out_display = display_table.copy()
-out_display[group_cols_rendered] = out_display[group_cols_rendered].applymap(strip_html_cell)
+out_display[group_cols_rendered] = out_display[group_cols_rendered].apply(lambda col: col.map(strip_html_cell))
 st.download_button(
     "Download display table (CSV)",
     data=out_display.to_csv(index=False),
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
 
 
