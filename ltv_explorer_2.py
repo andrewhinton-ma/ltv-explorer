@@ -13,30 +13,27 @@ def normalize_csv_url(u: str) -> str:
     if not u:
         return u
 
-    # Google Drive: /file/d/<ID>/... → uc?export=download&id=<ID>
-    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
+    # /file/d/<ID>/... → direct download
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", u)
     if m:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
 
-    # Google Drive: open?id=<ID> → uc?export=download&id=<ID>
-    m = re.search(r"drive\.google\.com/open\?id=([^&]+)", u)
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    # any drive link with ?id=<ID> (e.g. open?id=..., uc?id=..., view?id=...)
+    if "drive.google.com" in u:
+        parsed = urlparse(u)
+        qs = parse_qs(parsed.query)
+        fid = (qs.get("id") or [None])[0]
+        if fid:
+            return f"https://drive.google.com/uc?export=download&id={fid}"
 
-    # Google Drive: uc?id=<ID> → uc?export=download&id=<ID>
-    m = re.search(r"drive\.google\.com/uc\?id=([^&]+)", u)
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-
-    # Google Drive (usercontent) direct download link (YOUR CURRENT FORMAT)
-    # e.g. https://drive.usercontent.google.com/download?id=<ID>&export=download&authuser=1
+    # drive.usercontent.google.com/download?id=<ID> → normalize
     if "drive.usercontent.google.com" in u:
         qs = parse_qs(urlparse(u).query)
-        file_id = (qs.get("id") or [None])[0]
-        if file_id:
-            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        fid = (qs.get("id") or [None])[0]
+        if fid:
+            return f"https://drive.google.com/uc?export=download&id={fid}"
 
-    # Google Sheets → CSV export of the first tab (add &gid=### for a specific tab)
+    # Google Sheets → CSV (first sheet unless &gid specified)
     m = re.search(r"docs\.google\.com/spreadsheets/d/([^/]+)/", u)
     if m:
         return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv"
@@ -143,6 +140,8 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         na_values=["", "NA", "N/A", "null", "NULL"],
         low_memory=False
     )
+    df.columns = df.columns.map(lambda c: c.strip())
+    
     # Numeric coercions
     for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
               COLS["months6"], COLS["months12"], COLS["months24"]]:
@@ -172,6 +171,15 @@ except Exception as e:
 # Base cleaning step
 # -----------------
 df_base = df_raw.copy()
+# ADD THIS sanity check (keeps your existing logic intact otherwise)
+if COLS["trainer"] not in df_base.columns:
+    st.error(
+        f"Expected column '{COLS['trainer']}' not found. "
+        "This usually means the URL didn’t return a CSV (e.g., a Google login/HTML page). "
+        "Fix by: (1) Share the file as 'Anyone with link – Viewer', "
+        "and (2) paste any standard Drive link; the app will convert it."
+    )
+    st.stop()
 
 # Normalize categoricals early; collapse blanks to "Unknown"
 for cat_col in [COLS["gender"], COLS["region"], COLS["billing"], COLS["price_tier"], COLS["trainer"]]:
@@ -658,3 +666,4 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
