@@ -45,7 +45,10 @@ st.set_page_config(page_title="LTV Explorer", layout="wide")
 st.sidebar.header("Data")
 csv_path = st.sidebar.text_input(
     "CSV path or HTTPS URL",
-    value="DEFAULT_CSV_URL = https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0",
+    value=st.secrets.get(
+    "DEFAULT_CSV_URL",
+    "https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0"
+),
     placeholder="Paste a Google Drive/Sheets/Dropbox direct CSV link…",
     help="Local path or a direct HTTPS link to a CSV."
 )
@@ -112,13 +115,6 @@ COLS = dict(
 # Load CSV (local path or HTTPS). Cache for speed.
 # ------------------------------------------------
 @st.cache_data(show_spinner=True)
-csv_path_norm = normalize_csv_url(csv_path)
-if not csv_path_norm:
-    st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
-    st.stop()
-
-df_raw = load_data(csv_path_norm)
-
 def load_data(path_or_url: str) -> pd.DataFrame:
     header = pd.read_csv(path_or_url, nrows=0)
     parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
@@ -151,12 +147,13 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         df[COLS["trial_converted"]] = pd.to_numeric(df[COLS["trial_converted"]], errors="coerce")
     return df
 
-if not csv_path:
-    st.info("Provide a CSV path/URL to begin.")
+csv_path_norm = normalize_csv_url(csv_path)
+if not csv_path_norm:
+    st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
     st.stop()
 
 try:
-    df_raw = load_data(csv_path)
+    df_raw = load_data(csv_path_norm)
 except Exception as e:
     st.error(f"Failed to load CSV: {e}")
     st.stop()
@@ -651,4 +648,5 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
