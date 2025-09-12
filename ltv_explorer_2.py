@@ -5,6 +5,29 @@ import numpy as np
 from datetime import date
 import re
 from urllib.parse import urlparse, parse_qs
+import io, requests  # you already import these in your latest script
+def _read_csv_like(fobj, COLS):
+    fobj.seek(0)
+    header = pd.read_csv(fobj, nrows=0)
+    fobj.seek(0)
+    parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
+    dtype_overrides = {
+        COLS["trainer"]: "string",
+        COLS["gender"]: "string",
+        COLS["region"]: "string",
+        COLS["billing"]: "string",
+        COLS["price_tier"]: "string",
+    }
+    df = pd.read_csv(
+        fobj,
+        parse_dates=parse_dates,
+        dtype={k: v for k, v in dtype_overrides.items() if k in header.columns},
+        keep_default_na=True,
+        na_values=["", "NA", "N/A", "null", "NULL"],
+        low_memory=False
+    )
+    df.columns = df.columns.map(lambda c: c.strip())
+    return df
 
 def normalize_csv_url(u: str) -> str:
     if not isinstance(u, str):
@@ -123,37 +146,85 @@ COLS = dict(
 # ------------------------------------------------
 @st.cache_data(show_spinner=True)
 def load_data(path_or_url: str) -> pd.DataFrame:
-    header = pd.read_csv(path_or_url, nrows=0)
-    parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
-    dtype_overrides = {
-        COLS["trainer"]: "string",
-        COLS["gender"]: "string",
-        COLS["region"]: "string",
-        COLS["billing"]: "string",
-        COLS["price_tier"]: "string",
-    }
-    df = pd.read_csv(
-        path_or_url,
-        parse_dates=parse_dates,
-        dtype={k: v for k, v in dtype_overrides.items() if k in header.columns},
-        keep_default_na=True,
-        na_values=["", "NA", "N/A", "null", "NULL"],
-        low_memory=False
-    )
-    df.columns = df.columns.map(lambda c: c.strip())
-    
-    # Numeric coercions
+    def _read_from_buffer(buf: io.BytesIO) -> pd.DataFrame:
+        # read header to decide parse_dates/dtypes, then full file from same buffer
+        buf.seek(0)
+        header = pd.read_csv(buf, nrows=0)
+        buf.seek(0)
+        parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
+        dtype_overrides = {
+            COLS["trainer"]: "string",
+            COLS["gender"]: "string",
+            COLS["region"]: "string",
+            COLS["billing"]: "string",
+            COLS["price_tier"]: "string",
+        }
+        df = pd.read_csv(
+            buf,
+            parse_dates=parse_dates,
+            dtype={k: v for k, v in dtype_overrides.items() if k in header.columns},
+            keep_default_na=True,
+            na_values=["", "NA", "N/A", "null", "NULL"],
+            low_memory=False,
+        )
+        df.columns = df.columns.map(lambda c: c.strip())
+        return df
+
+    def _looks_like_html_bytes(b: bytes) -> bool:
+        sniff = b[:512].lstrip().lower()
+        return sniff.startswith(b"<!doctype html") or sniff.startswith(b"<html") or b"<body" in sniff
+
+    # If it's a URL, fetch it first so we can detect Drive's HTML interstitial
+    if isinstance(path_or_url, str) and path_or_url.lower().startswith(("http://", "https://")):
+        url = path_or_url
+        try:
+            r = requests.get(url, allow_redirects=True, timeout=90)
+            r.raise_for_status()
+            content = r.content
+            ct = (r.headers.get("Content-Type") or "").lower()
+        except Exception as e:
+            raise RuntimeError(f"HTTP fetch failed: {e}")
+
+        # If Drive served HTML (virus-scan page / login), fall back to gdown which handles it
+        if "text/html" in ct or _looks_like_html_bytes(content):
+            try:
+                import gdown  # lazy import so app still runs without it for local files
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
+                    tmp_path = tf.name
+                # fuzzy=True lets gdown accept open?id=..., file/d/..., uc?id=..., etc.
+                gdown.download(url, tmp_path, quiet=True, fuzzy=True)
+                with open(tmp_path, "rb") as f:
+                    buf = io.BytesIO(f.read())
+                os.unlink(tmp_path)
+                df = _read_from_buffer(buf)
+            except Exception as ge:
+                raise RuntimeError(
+                    "The provided Google Drive link returned an HTML page (likely the large-file "
+                    "‘download anyway’ interstitial). The automatic fallback also failed. "
+                    "Make sure the file is shared as **Anyone with the link (Viewer)**. "
+                    f"(gdown error: {ge})"
+                )
+        else:
+            # Direct CSV bytes
+            df = _read_from_buffer(io.BytesIO(content))
+    else:
+        # Local path
+        with open(path_or_url, "rb") as f:
+            df = _read_from_buffer(io.BytesIO(f.read()))
+
+    # ---- Numeric coercions & trial flags (unchanged) ----
     for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
               COLS["months6"], COLS["months12"], COLS["months24"]]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # trial flags
+
     if COLS["trial_days"] in df.columns:
         df[COLS["trial_days"]] = pd.to_numeric(df[COLS["trial_days"]], errors="coerce")
     if COLS["trial_flag"] not in df.columns and COLS["trial_days"] in df.columns:
         df[COLS["trial_flag"]] = (df[COLS["trial_days"]].fillna(0) > 0).astype(int)
     if COLS["trial_converted"] in df.columns:
         df[COLS["trial_converted"]] = pd.to_numeric(df[COLS["trial_converted"]], errors="coerce")
+
     return df
 
 csv_path_norm = normalize_csv_url(csv_path)
@@ -666,4 +737,5 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
