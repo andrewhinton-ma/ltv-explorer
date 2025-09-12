@@ -7,6 +7,7 @@ import re
 from urllib.parse import urlparse, parse_qs
 import io, requests
 import os, tempfile
+
 def _read_csv_like(fobj, COLS):
     fobj.seek(0)
     header = pd.read_csv(fobj, nrows=0)
@@ -68,6 +69,23 @@ def normalize_csv_url(u: str) -> str:
 
     return u
 
+# --- move this above load_data to remove any doubt ---
+def extract_gdrive_id(u: str) -> str | None:
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", u)
+    if m:
+        return m.group(1)
+    qs = parse_qs(urlparse(u).query)
+    fid = (qs.get("id") or [None])[0]
+    if fid:
+        return fid
+    return None
+# -----------------------------------------------------
+
 st.set_page_config(page_title="LTV Explorer", layout="wide")
 
 # -----------------------------
@@ -77,9 +95,9 @@ st.sidebar.header("Data")
 csv_path = st.sidebar.text_input(
     "CSV path or HTTPS URL",
     value=st.secrets.get(
-    "DEFAULT_CSV_URL",
-    "https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0"
-),
+        "DEFAULT_CSV_URL",
+        "https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0"
+    ),
     placeholder="Paste a Google Drive/Sheets/Dropbox direct CSV link…",
     help="Local path or a direct HTTPS link to a CSV."
 )
@@ -147,34 +165,8 @@ COLS = dict(
 # ------------------------------------------------
 @st.cache_data(show_spinner=True)
 def load_data(path_or_url: str) -> pd.DataFrame:
-    import io
-    import requests
-
-    def _read_from_buffer(buf: io.BytesIO) -> pd.DataFrame:
-        buf.seek(0)
-        header = pd.read_csv(buf, nrows=0)
-        buf.seek(0)
-        parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
-        dtype_overrides = {
-            COLS["trainer"]: "string",
-            COLS["gender"]: "string",
-            COLS["region"]: "string",
-            COLS["billing"]: "string",
-            COLS["price_tier"]: "string",
-        }
-        df = pd.read_csv(
-            buf,
-            parse_dates=parse_dates,
-            dtype={k: v for k, v in dtype_overrides.items() if k in header.columns},
-            keep_default_na=True,
-            na_values=["", "NA", "N/A", "null", "NULL"],
-            low_memory=False,
-        )
-        df.columns = df.columns.map(lambda c: c.strip())
-        return df
-
     def _looks_like_html_bytes(b: bytes) -> bool:
-        sniff = b[:2048].lstrip().lower()
+        sniff = b[:4096].lstrip().lower()
         return (
             sniff.startswith(b"<!doctype html")
             or sniff.startswith(b"<html")
@@ -185,75 +177,116 @@ def load_data(path_or_url: str) -> pd.DataFrame:
             or b"sign in" in sniff
         )
 
-    # Helper: robust gdown-by-ID fallback
-    def _gdown_fetch(any_url: str) -> bytes:
-        import gdown, tempfile, os
+    def _read_from_path(csv_path_local: str) -> pd.DataFrame:
+        header = pd.read_csv(csv_path_local, nrows=0)
+        parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
+        dtype_overrides = {
+            COLS["trainer"]: "string",
+            COLS["gender"]: "string",
+            COLS["region"]: "string",
+            COLS["billing"]: "string",
+            COLS["price_tier"]: "string",
+        }
+        df = pd.read_csv(
+            csv_path_local,
+            parse_dates=parse_dates,
+            dtype={k: v for k, v in dtype_overrides.items() if k in header.columns},
+            keep_default_na=True,
+            na_values=["", "NA", "N/A", "null", "NULL"],
+            low_memory=False,
+        )
+        df.columns = df.columns.map(lambda c: c.strip())
+        return df
+
+    # Robust: download to temp file to avoid huge in-memory buffers
+    def _download_to_tempfile(url: str) -> str:
+        # First small peek to detect HTML; then stream rest to disk
+        with requests.get(
+            url,
+            stream=True,
+            timeout=180,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"},
+        ) as r:
+            r.raise_for_status()
+            ct = (r.headers.get("Content-Type") or "").lower()
+            # Peek a small chunk
+            try:
+                first_chunk = next(r.iter_content(chunk_size=8192))
+            except StopIteration:
+                first_chunk = b""
+
+            if "text/html" in ct or _looks_like_html_bytes(first_chunk):
+                raise ValueError("HTML interstitial detected")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
+                tmp_path = tf.name
+                if first_chunk:
+                    tf.write(first_chunk)
+                for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
+                    if chunk:
+                        tf.write(chunk)
+        return tmp_path
+
+    def _gdown_to_tempfile(any_url: str) -> str:
+        import gdown
         fid = extract_gdrive_id(any_url)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
             tmp_path = tf.name
         try:
             if fid:
-                # Using the file ID is the most reliable path for Drive confirm pages
                 gdown.download(id=fid, output=tmp_path, quiet=True)
             else:
                 gdown.download(any_url, tmp_path, quiet=True, fuzzy=True)
-            with open(tmp_path, "rb") as f:
-                return f.read()
-        finally:
+            return tmp_path
+        except Exception as e:
+            # Clean up if gdown failed
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
+            raise RuntimeError(f"gdown failed: {e}")
 
-    # ---- URL case: fetch first so we can detect Drive’s HTML interstitial ----
+    # ---- URL case ----
     if isinstance(path_or_url, str) and path_or_url.lower().startswith(("http://", "https://")):
         url = path_or_url
+        tmp_path = None
         try:
-            r = requests.get(
-                url,
-                allow_redirects=True,
-                timeout=120,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                       "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"}
-            )
-            r.raise_for_status()
-            content = r.content
-            ct = (r.headers.get("Content-Type") or "").lower()
+            # Try direct streaming download
+            try:
+                tmp_path = _download_to_tempfile(url)
+            except ValueError:
+                # HTML detected → use gdown
+                tmp_path = _gdown_to_tempfile(url)
+
+            # Parse CSV from disk
+            df = _read_from_path(tmp_path)
         except Exception as e:
-            raise RuntimeError(f"HTTP fetch failed: {e}")
-
-        # If Drive served HTML (virus-scan/confirm/quota/login), switch to gdown-by-ID
-        if "text/html" in ct or _looks_like_html_bytes(content):
+            # Last-ditch: gdown even if the first attempt wasn't HTML
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
             try:
-                content = _gdown_fetch(url)
+                tmp_path = _gdown_to_tempfile(url)
+                df = _read_from_path(tmp_path)
             except Exception as ge:
                 raise RuntimeError(
-                    "Google Drive returned an HTML page (large-file confirm/quota/login). "
-                    "Automatic fallback via gdown failed. Ensure sharing is **Anyone with the link (Viewer)**. "
-                    f"(gdown error: {ge})"
+                    "Failed to obtain a CSV from Google Drive. "
+                    "Ensure the file is shared as **Anyone with the link (Viewer)**. "
+                    f"(detail: {e}; gdown retry: {ge})"
                 )
-
-        # Try to parse as CSV; if parsing fails, try gdown once more (even if bytes arrived)
-        try:
-            df = _read_from_buffer(io.BytesIO(content))
-        except Exception:
-            # Safety net: sometimes Drive returns non-CSV bytes with non-HTML content-type
-            try:
-                content = _gdown_fetch(url)
-                df = _read_from_buffer(io.BytesIO(content))
-            except Exception as ge:
-                raise RuntimeError(
-                    "Downloaded bytes could not be parsed as CSV, and the gdown fallback failed. "
-                    "If this is a Google Sheet, use its **File → Download → CSV** link or a "
-                    "Sheets export URL; for Drive files, supply any standard share link. "
-                    f"(parse/gdown error: {ge})"
-                )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     else:
         # ---- Local path ----
-        with open(path_or_url, "rb") as f:
-            content = f.read()
-        df = _read_from_buffer(io.BytesIO(content))
+        df = _read_from_path(path_or_url)
 
     # ---- Numeric coercions & trial flags (unchanged) ----
     for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
@@ -268,29 +301,11 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         df[COLS["trial_converted"]] = pd.to_numeric(df[COLS["trial_converted"]], errors="coerce")
 
     return df
-    
+
 csv_path_norm = normalize_csv_url(csv_path)
 if not csv_path_norm:
     st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
     st.stop()
-
-def extract_gdrive_id(u: str) -> str | None:
-    if not isinstance(u, str):
-        return None
-    u = u.strip()
-    if not u:
-        return None
-    # /file/d/<ID>
-    m = re.search(r"drive\.google\.com/file/d/([^/]+)", u)
-    if m:
-        return m.group(1)
-    # ?id=<ID> (open?id=..., uc?id=..., view?id=..., usercontent?id=...)
-    qs = parse_qs(urlparse(u).query)
-    fid = (qs.get("id") or [None])[0]
-    if fid:
-        return fid
-    return None
-
 
 # Button-gated load so the app renders fast, then downloads on demand
 if "data_token" not in st.session_state:
@@ -305,7 +320,6 @@ if st.session_state.data_token == 0:
     st.stop()
 
 try:
-    # cache key includes the URL; the button increments token so users can force a refresh
     df_raw = load_data(csv_path_norm)
 except Exception as e:
     st.error(f"Failed to load CSV: {e}")
@@ -315,7 +329,6 @@ except Exception as e:
 # Base cleaning step
 # -----------------
 df_base = df_raw.copy()
-# ADD THIS sanity check (keeps your existing logic intact otherwise)
 if COLS["trainer"] not in df_base.columns:
     st.error(
         f"Expected column '{COLS['trainer']}' not found. "
@@ -372,7 +385,6 @@ def clamp_list(key: str, options: list[str]) -> list[str]:
 st.header("LTV Explorer")
 st.markdown("#### Creators filter")
 
-# Persist selection; options from the master list so it doesn’t wipe on date change
 if "selected_creators" not in st.session_state:
     st.session_state.selected_creators = all_creators_master.copy()
 
@@ -390,12 +402,10 @@ selected_creators = colL.multiselect(
     help="Type to search. Use Select all / Clear all to bulk update."
 )
 
-# Early exit if none selected
 if len(selected_creators) == 0:
     st.warning("No creators selected. Use **Select all** or choose one or more creators to proceed.")
     st.stop()
 
-# Intersection control: persist checkbox (never auto-toggles)
 if "restrict_all" not in st.session_state:
     st.session_state.restrict_all = True
 restrict_all = st.checkbox(
@@ -403,14 +413,12 @@ restrict_all = st.checkbox(
     key="restrict_all"
 )
 
-# Apply global creator filter AFTER building option lists
 df = df0[df0[COLS["trainer"]].isin(selected_creators)]
 
 # -----------------------------------
 # Group toggles + names + filters UI
 # -----------------------------------
 st.markdown("#### Groups")
-# Names (A is always visible)
 cA1, cA2 = st.columns([0.18, 0.82])
 cA1.write("Group A")
 name_A = cA2.text_input("Name for Group A", value="Weekly", key="name_A", label_visibility="collapsed")
@@ -427,9 +435,7 @@ cD1, cD2 = st.columns([0.18, 0.82])
 show_D = cD1.checkbox("Show Group D", value=False, key="show_D")
 name_D = cD2.text_input("Name for Group D", value="Annual", key="name_D", label_visibility="collapsed") if show_D else "Group D"
 
-# ---- Guard against duplicate group names (must be unique) ----
 active_labels = [name_A] + ([name_B] if show_B else []) + ([name_C] if show_C else []) + ([name_D] if show_D else [])
-# normalize whitespace for comparison (and keep original for display)
 norm = [lbl.strip() for lbl in active_labels]
 dupes = sorted({lbl for lbl in norm if norm.count(lbl) > 1})
 if dupes:
@@ -451,15 +457,9 @@ def group_banner(label: str, code: str):
     )
 
 def group_filter_ui(code: str, label: str, visible: bool):
-    """Return (filters_dict, include_trials_mode). include_trials_mode:
-       0 = exclude trials, 1 = include only converted trials."""
     if not visible:
         return None, 0
-
-    # Keys for session persistence
     kG, kR, kC, kT, kTrial = f"gender_{code}", f"region_{code}", f"cycle_{code}", f"tier_{code}", f"trials_{code}"
-
-    # Initialize/clamp session values (no default args in widgets)
     st.session_state[kG] = clamp_list(kG, gender_opts_base)
     st.session_state[kR] = clamp_list(kR, region_opts_base)
     st.session_state[kC] = clamp_list(kC, cycle_opts_base)
@@ -469,7 +469,6 @@ def group_filter_ui(code: str, label: str, visible: bool):
 
     group_banner(f"Filters — {label}", code)
     with st.expander("", expanded=False):
-        # Reset button for this group
         if st.button(f"Reset filters for {label}", key=f"reset_{code}"):
             st.session_state[kG] = gender_opts_base.copy()
             st.session_state[kR] = region_opts_base.copy()
@@ -495,15 +494,12 @@ def group_filter_ui(code: str, label: str, visible: bool):
 def apply_group_filters(dfin: pd.DataFrame, flt, trials_mode):
     if flt is None:
         return pd.DataFrame(columns=dfin.columns)
-
     out = dfin[
         dfin[COLS["gender"]].isin(flt["genders"]) &
         dfin[COLS["region"]].isin(flt["regions"]) &
         dfin[COLS["billing"]].isin(flt["cycles"]) &
         dfin[COLS["price_tier"]].isin(flt["tiers"])
     ].copy()
-
-    # Trial logic
     if COLS["trial_flag"] in out.columns:
         if trials_mode == 0:
             out = out[out[COLS["trial_flag"]].fillna(0) == 0]
@@ -515,7 +511,6 @@ def apply_group_filters(dfin: pd.DataFrame, flt, trials_mode):
                 ]
             else:
                 out = out[out[COLS["trial_flag"]].fillna(0) == 0]
-
     return out
 
 # Build group UIs
@@ -538,7 +533,6 @@ cols[0].metric("Rows after cleaning", len(df))
 for i, (_, label, _, gdf) in enumerate(groups_all, start=1):
     cols[i].metric(f"{label} rows", len(gdf))
 
-# If nothing left, stop
 if all(gdf.empty for _,_,_,gdf in groups_all):
     st.warning("All groups are empty with current filters.")
     st.stop()
@@ -547,7 +541,6 @@ if all(gdf.empty for _,_,_,gdf in groups_all):
 # Aggregation helpers & metric preparation
 # -----------------------------------------
 def agg_by_creator(dfin: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per creator for the chosen horizon."""
     if dfin.empty:
         return pd.DataFrame(columns=[COLS["trainer"], "subs", "ltv_mean", "ltv_median", "ltv_sum", "months_avg"])
     months_col = {6: COLS["months6"], 12: COLS["months12"], 24: COLS["months24"]}[horizon]
@@ -583,7 +576,6 @@ for code, label, _, _ in groups_all:
 
 rank_base["_total_revenue_all_groups"] = rank_base[rev_cols_for_total].sum(axis=1, skipna=True)
 
-# Restrict creators by min_subs across ALL visible groups (if toggled)
 if restrict_all and len(groups_all) >= 1:
     eligible_sets = []
     for code, _, _, _ in groups_all:
@@ -596,7 +588,6 @@ if restrict_all and len(groups_all) >= 1:
         for code in list(per_group.keys()):
             per_group[code] = per_group[code][per_group[code][COLS["trainer"]].isin(must_have)]
 
-# Row sort selector
 sort_choice = st.selectbox(
     "Sort rows by",
     options=["Total LTV (across visible groups)", "Creator (A→Z)"],
@@ -637,7 +628,6 @@ metric_map = {
 }
 metric_col = metric_map[metric_choice]
 
-# Assemble wide numeric matrix & subs counts for shown groups only
 top_creators_series = pd.Series(top_creators, dtype="string")
 wide_num = pd.DataFrame({"Creator": top_creators_series})
 wide_subs = pd.DataFrame({"Creator": top_creators_series})
@@ -652,25 +642,22 @@ for code, label, _, _ in groups_all:
     wide_subs = wide_subs.merge(t[["Creator", "subs"]],     how="left", on="Creator").rename(columns={"subs": scol})
     group_cols_rendered.append(mcol)
 
-# Apply min_subs rule: hide values where subs < threshold
 for label in group_cols_rendered:
     subs_col = f"{label}__subs"
     mask_low = (wide_subs[subs_col].fillna(0) < min_subs)
     wide_num.loc[mask_low, label] = np.nan
 
-# Numeric matrix (for styling + deltas) & subs aligned
 numeric_for_style = wide_num.set_index("Creator")[group_cols_rendered].copy()
 subs_df = wide_subs.set_index("Creator")[[f"{g}__subs" for g in group_cols_rendered]].copy()
 subs_df.columns = group_cols_rendered
 
-# ----- Delta row (median % uplift vs base Group A) pinned to top -----
 delta_label = f"Median % uplift vs. base ({name_A})"
 if name_A in group_cols_rendered:
     base_vals = numeric_for_style[name_A]
     deltas = {}
     for label in group_cols_rendered:
         if label == name_A:
-            deltas[label] = 0.0  # show 0% for base, and include in styling
+            deltas[label] = 0.0
         else:
             comp_vals = numeric_for_style[label]
             pct = (comp_vals - base_vals) / base_vals.replace(0, np.nan)
@@ -679,7 +666,6 @@ if name_A in group_cols_rendered:
 else:
     delta_numeric_row = pd.Series([np.nan] * len(group_cols_rendered), index=group_cols_rendered, name=delta_label)
 
-# Build HTML cell strings
 def fmt_cell(val, n):
     if pd.isna(val):
         v = ""
@@ -695,23 +681,18 @@ def fmt_pct_cell(p):
         return "<div class='cell'><span class='subs'></span><span class='val'></span></div>"
     return f"<div class='cell'><span class='subs'></span><span class='val'>{int(np.round(p*100,0))}%</span></div>"
 
-# Creator rows
 render_html = pd.DataFrame(index=numeric_for_style.index, columns=group_cols_rendered, data="")
 for col in group_cols_rendered:
     render_html[col] = [fmt_cell(numeric_for_style.loc[idx, col], subs_df.loc[idx, col]) for idx in numeric_for_style.index]
 
-# Delta row (percentages)
 delta_html_row = pd.Series({col: fmt_pct_cell(delta_numeric_row[col]) for col in group_cols_rendered}, name=delta_label)
 
-# Combine: delta row then creators
 combined_html = pd.concat([pd.DataFrame([delta_html_row]), render_html])
 combined_numeric = pd.concat([pd.DataFrame([delta_numeric_row]), numeric_for_style])
 
-# Add single "Creator" column at left; hide index via Styler
 display_table = combined_html.copy()
 display_table.insert(0, "Creator", [delta_label] + numeric_for_style.index.tolist())
 
-# Row-wise extrema styles driven by numeric values
 def row_extrema_styles(values_row):
     vals = values_row.values.astype(float)
     finite_mask = np.isfinite(vals)
@@ -737,7 +718,6 @@ styler = display_table.style.apply(
     subset=group_cols_rendered
 ).hide(axis="index")
 
-# Bold outline for the delta row
 def emphasize_delta(df: pd.DataFrame):
     styles = pd.DataFrame("", index=df.index, columns=df.columns)
     if delta_label in styles.index:
@@ -746,17 +726,11 @@ def emphasize_delta(df: pd.DataFrame):
 
 styler = styler.apply(emphasize_delta, axis=None)
 
-# ------------------
-# Title + table note
-# ------------------
 title_metric = {"Mean LTV":"Mean LTV", "Median LTV":"Median LTV", "Sum LTV":"Sum LTV",
                 "Avg Months Active":"Avg Months Active", "Subs":"Subs"}[metric_choice]
 st.subheader(f"Top {top_n} creators — {title_metric} by group")
 st.caption("Row-wise max = green, min = red. Values hidden when subs < threshold; subs count is shown at the left of each cell.")
 
-# ------------
-# Custom CSS
-# ------------
 colors = ["#eaf2ff", "#e3edff", "#dce8ff", "#d5e3ff"]
 borders = ["#6ea8fe", "#639bff", "#5991ff", "#4f86ff"]
 
@@ -776,12 +750,8 @@ css = f"""
 """
 st.markdown(css, unsafe_allow_html=True)
 
-# Render final table
 st.markdown(styler.to_html(), unsafe_allow_html=True)
 
-# --------------------
-# Downloads (optional)
-# --------------------
 out_numeric = combined_numeric.copy()
 out_numeric.insert(0, "Creator", [delta_label] + numeric_for_style.index.tolist())
 st.download_button(
@@ -810,9 +780,3 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
-
-
-
-
-
-
