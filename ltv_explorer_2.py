@@ -147,7 +147,6 @@ COLS = dict(
 @st.cache_data(show_spinner=True)
 def load_data(path_or_url: str) -> pd.DataFrame:
     def _read_from_buffer(buf: io.BytesIO) -> pd.DataFrame:
-        # read header to decide parse_dates/dtypes, then full file from same buffer
         buf.seek(0)
         header = pd.read_csv(buf, nrows=0)
         buf.seek(0)
@@ -174,21 +173,33 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         sniff = b[:512].lstrip().lower()
         return sniff.startswith(b"<!doctype html") or sniff.startswith(b"<html") or b"<body" in sniff
 
-    # If it's a URL, fetch it first so we can detect Drive's HTML interstitial
+    # URL path → fetch & sniff
     if isinstance(path_or_url, str) and path_or_url.lower().startswith(("http://", "https://")):
         url = path_or_url
         try:
-            r = requests.get(url, allow_redirects=True, timeout=90)
+            r = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=90,
+                headers={"User-Agent": "Mozilla/5.0"}  # helps with some CDNs/Drive
+            )
             r.raise_for_status()
             content = r.content
             ct = (r.headers.get("Content-Type") or "").lower()
         except Exception as e:
             raise RuntimeError(f"HTTP fetch failed: {e}")
 
-        # If Drive served HTML (virus-scan page / login), fall back to gdown which handles it
+        # If Drive interstitial (HTML) → use gdown to bypass
         if "text/html" in ct or _looks_like_html_bytes(content):
             try:
-                import gdown  # lazy import so app still runs without it for local files
+                try:
+                    import gdown  # lazy import
+                except Exception as ie:
+                    raise RuntimeError(
+                        "Google Drive returned an HTML confirmation page for this large file. "
+                        "Install gdown (add 'gdown>=5.1.0' to requirements.txt)."
+                    ) from ie
+
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tf:
                     tmp_path = tf.name
                 # fuzzy=True lets gdown accept open?id=..., file/d/..., uc?id=..., etc.
@@ -200,10 +211,10 @@ def load_data(path_or_url: str) -> pd.DataFrame:
             except Exception as ge:
                 raise RuntimeError(
                     "The provided Google Drive link returned an HTML page (likely the large-file "
-                    "‘download anyway’ interstitial). The automatic fallback also failed. "
-                    "Make sure the file is shared as **Anyone with the link (Viewer)**. "
-                    f"(gdown error: {ge})"
-                )
+                    "‘download anyway’ interstitial), and the fallback failed. "
+                    "Ensure the file is shared as **Anyone with the link (Viewer)** and that "
+                    "your app has 'gdown' installed."
+                ) from ge
         else:
             # Direct CSV bytes
             df = _read_from_buffer(io.BytesIO(content))
@@ -212,7 +223,7 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         with open(path_or_url, "rb") as f:
             df = _read_from_buffer(io.BytesIO(f.read()))
 
-    # ---- Numeric coercions & trial flags (unchanged) ----
+    # Numeric coercions & trial flags (unchanged)
     for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
               COLS["months6"], COLS["months12"], COLS["months24"]]:
         if c in df.columns:
@@ -737,5 +748,6 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
 
