@@ -3,6 +3,39 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date
+import re
+from urllib.parse import urlparse, parse_qs
+
+def normalize_csv_url(u: str) -> str:
+    if not isinstance(u, str):
+        return u
+    u = u.strip()
+    if not u:
+        return u
+
+    # Google Drive: /file/d/<ID>/... → uc?export=download&id=<ID>
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+
+    # Google Drive (usercontent) direct download link (YOUR CURRENT FORMAT)
+    # e.g. https://drive.usercontent.google.com/download?id=<ID>&export=download&authuser=1
+    if "drive.usercontent.google.com" in u:
+        qs = parse_qs(urlparse(u).query)
+        file_id = (qs.get("id") or [None])[0]
+        if file_id:
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    # Google Sheets → CSV export of the first tab (add &gid=### for a specific tab)
+    m = re.search(r"docs\.google\.com/spreadsheets/d/([^/]+)/", u)
+    if m:
+        return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv"
+
+    # Dropbox share → force download
+    if "dropbox.com" in u:
+        return u.replace("?dl=0", "?dl=1")
+
+    return u
 
 st.set_page_config(page_title="LTV Explorer", layout="wide")
 
@@ -12,8 +45,9 @@ st.set_page_config(page_title="LTV Explorer", layout="wide")
 st.sidebar.header("Data")
 csv_path = st.sidebar.text_input(
     "CSV path or HTTPS URL",
-    value="EXPANDED BIG subs file v7.csv",
-    help="Local path or public HTTPS link to a CSV (e.g., Google Drive 'anyone with link')."
+    value="DEFAULT_CSV_URL = https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0",
+    placeholder="Paste a Google Drive/Sheets/Dropbox direct CSV link…",
+    help="Local path or a direct HTTPS link to a CSV."
 )
 
 # Created-since date filter
@@ -78,6 +112,13 @@ COLS = dict(
 # Load CSV (local path or HTTPS). Cache for speed.
 # ------------------------------------------------
 @st.cache_data(show_spinner=True)
+csv_path_norm = normalize_csv_url(csv_path)
+if not csv_path_norm:
+    st.info("Paste a CSV link (Drive/Sheets/Dropbox) or provide a local path.")
+    st.stop()
+
+df_raw = load_data(csv_path_norm)
+
 def load_data(path_or_url: str) -> pd.DataFrame:
     header = pd.read_csv(path_or_url, nrows=0)
     parse_dates = [c for c in [COLS["created"], COLS["cancel_ts"]] if c in header.columns]
@@ -610,3 +651,4 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
