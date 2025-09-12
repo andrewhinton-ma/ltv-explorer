@@ -18,6 +18,16 @@ def normalize_csv_url(u: str) -> str:
     if m:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
 
+    # Google Drive: open?id=<ID> → uc?export=download&id=<ID>
+    m = re.search(r"drive\.google\.com/open\?id=([^&]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+
+    # Google Drive: uc?id=<ID> → uc?export=download&id=<ID>
+    m = re.search(r"drive\.google\.com/uc\?id=([^&]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+
     # Google Drive (usercontent) direct download link (YOUR CURRENT FORMAT)
     # e.g. https://drive.usercontent.google.com/download?id=<ID>&export=download&authuser=1
     if "drive.usercontent.google.com" in u:
@@ -648,5 +658,3 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
-
-
