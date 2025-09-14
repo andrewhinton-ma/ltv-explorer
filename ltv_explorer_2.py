@@ -96,9 +96,9 @@ csv_path = st.sidebar.text_input(
     "CSV path or HTTPS URL",
     value=st.secrets.get(
         "DEFAULT_CSV_URL",
-        "https://drive.google.com/uc?export=download&id=1dsVPCk1kdsp8NsGqcY700vQKIABBvHZ0"
+        "s3://ltv-data-andrew-2025/subs.csv"
     ),
-    placeholder="Paste a Google Drive/Sheets/Dropbox direct CSV link…",
+    placeholder="Paste a s3 link to subs csv…",
     help="Local path or a direct HTTPS link to a CSV."
 )
 
@@ -780,5 +780,6 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
 
