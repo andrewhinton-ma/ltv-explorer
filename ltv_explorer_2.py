@@ -69,7 +69,7 @@ def normalize_csv_url(u: str) -> str:
 
     return u
 
-# --- move this above load_data to remove any doubt ---
+# --- moving this above load_data to remove any doubt ---
 def extract_gdrive_id(u: str) -> str | None:
     if not isinstance(u, str):
         return None
@@ -289,10 +289,15 @@ def load_data(path_or_url: str) -> pd.DataFrame:
         df = _read_from_path(path_or_url)
 
     # ---- Numeric coercions & trial flags (unchanged) ----
-    for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"],
-              COLS["months6"], COLS["months12"], COLS["months24"]]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in [COLS["price"], COLS["rev6"], COLS["rev12"], COLS["rev24"]]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+for c in [COLS["months6"], COLS["months12"], COLS["months24"]]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce", downcast="integer")
+if COLS["id"] in df.columns:
+    df[COLS["id"]] = pd.to_numeric(df[COLS["id"]], errors="coerce", downcast="integer")
+
     if COLS["trial_days"] in df.columns:
         df[COLS["trial_days"]] = pd.to_numeric(df[COLS["trial_days"]], errors="coerce")
     if COLS["trial_flag"] not in df.columns and COLS["trial_days"] in df.columns:
@@ -343,7 +348,8 @@ for cat_col in [COLS["gender"], COLS["region"], COLS["billing"], COLS["price_tie
     if cat_col in df_base.columns:
         s = df_base[cat_col].astype(str).str.strip()
         s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-        df_base[cat_col] = s.fillna("Unknown")
+        df_base[cat_col] = s.fillna("Unknown").astype("category")
+
 
 # ---- Master creator list (does NOT depend on created_since) ----
 all_creators_master = sorted(df_base[COLS["trainer"]].dropna().astype(str).unique().tolist())
@@ -780,6 +786,7 @@ st.download_button(
     file_name=f"creators_top{top_n}_{metric_map[metric_choice]}_{horizon}m_display.csv",
     mime="text/csv"
 )
+
 
 
 
